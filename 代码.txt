@@ -1,0 +1,956 @@
+#urls.py
+
+from django.urls import path
+from . import views
+from PIL import Image
+import io
+
+
+urlpatterns = [
+    path('', views.home, name='potato-home'),
+    path('about/', views.about, name='potato-about'),
+    path('latestnews/', views.latest_news, name='latest-news'),
+    # 显示所有地点的生长阶段总览
+    path('location_growth_stage/', views.location_growth_stage, name='location_growth_stage'),
+    path('download_growth_stage/', views.download_location_growth_stage, name='download_location_growth_stage'),  # 下载 Excel
+    path('error/', views.about, name='error'),
+    path('success/', views.about, name='success'),
+    path("upload/", views.pre_page, name="potato-upload"),  # 访问 /pre/ 显示预测页面
+    path("predict_images/", views.combined_predict, name="predict_images"),
+    path('create-superuser/', views.create_superuser_view, name='create_superuser'),
+    path('image-fetch-config/', views.fetch_config_view, name='fetch_config'),  # 处理配置页面
+    path('local_dec/', views.pre_page, name='local_dec'),
+]
+
+#moedls.py
+# 标准库导入
+import logging
+import os
+import re
+# 第三方库导入
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from PIL import Image
+from sympy import false
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms, models
+from torchvision.models import densenet121, DenseNet121_Weights
+import torchvision
+# Django 导入
+from django.contrib.auth.models import User
+from django.core.validators import MaxValueValidator, MinValueValidator
+from django.db import models
+from django.db.models.signals import post_save, post_delete
+from django.dispatch import receiver
+from django.utils import timezone
+from django.utils.timezone import now
+# 本地应用导入
+from .net import AttentionLayer, GlobalNet, Net
+
+STAGE_ORDER = {
+    '播种期': 0,
+    '出苗期': 1,
+    '分枝期': 2,
+    '花序形成期': 3,
+    '开花期': 4,
+    '可收期': 5
+}
+
+# 配置日志
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# 获取 Django 应用的绝对路径
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# 设定模型路径
+MODEL_PATH = os.path.join(BASE_DIR, "models", "ds.pth")
+
+
+class GlobalDenseNetModel:
+    def __init__(self, model_path):  # 允许传入模型路径
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"[DEBUG] 全局模型路径: {model_path}")
+        print(f"[DEBUG] 模型文件存在: {os.path.exists(model_path)}")
+
+
+        self.model_path = model_path  # 存储模型路径
+        self.transform = self.get_transform()  # ✅ 确保 get_transform() 存在
+        self.model = self.load_model()
+        print(f"[DEBUG] 模型加载状态: {self.model is not None}")
+        self.class_names = ["播种期","出苗期", "分枝期", "花序形成期", "开花期", "可收期"]
+
+    def get_transform(self):
+        """定义图像预处理步骤"""
+        return transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+
+    def load_model(self):
+        try:
+            model = GlobalNet()  # 使用修正后的模型结构
+
+            # 兼容性加载（处理参数名不匹配）
+            state_dict = torch.load(self.model_path, map_location=self.device)
+
+            # 参数名映射修正（根据实际需要调整）
+            fixed_dict = {}
+            for k, v in state_dict.items():
+                if k.startswith("densenet."):
+                    fixed_k = k.replace("densenet.", "base.")  # 修正层级
+                    fixed_dict[fixed_k] = v
+                else:
+                    fixed_dict[k] = v
+
+            model.load_state_dict(fixed_dict, strict=false)  # 严格匹配
+            return model.to(self.device).eval()
+
+        except Exception as e:
+            print(f"[ERROR] 模型加载失败细节: {str(e)}")
+            return None
+
+    def predict(self, image):
+        """对上传的图片进行预测"""
+        if self.model is None:
+            return None, None
+
+        try:
+            if isinstance(image, str) or hasattr(image, 'read'):
+                image = Image.open(image).convert("RGB")
+            elif isinstance(image, Image.Image):
+                image = image.convert("RGB")
+            else:
+                raise ValueError("无效的 image 类型")
+
+            image = self.transform(image).unsqueeze(0).to(self.device)
+
+            with torch.no_grad():
+                outputs = self.model(image)
+                probabilities = torch.softmax(outputs, dim=1)
+                _, predicted = torch.max(outputs, 1)
+
+            pred_class = self.class_names[predicted.item()]
+            confidence = probabilities[0][predicted.item()].item()
+            return pred_class, confidence
+
+        except Exception as e:
+            logging.error(f"预测失败: {e}")
+            return None, None
+
+
+
+
+class DenseNetModel:
+    def __init__(self, model_path):  # 允许传入模型路径
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model_path = model_path  # 存储模型路径
+        self.transform = self.get_transform()  # ✅ 确保 get_transform() 存在
+        self.model = self.load_model()  # 加载模型
+        self.class_names = ["出苗期", "分枝期", "花序形成期", "开花期", "可收期"]
+
+    def get_transform(self):
+        """定义图像预处理步骤"""
+        return transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+
+    def load_model(self):
+        """加载 PyTorch 模型"""
+        if not os.path.exists(self.model_path):
+            logging.error(f"模型文件 {self.model_path} 不存在")
+            return None
+        try:
+            model = Net().to(self.device)
+            model.load_state_dict(torch.load(self.model_path, map_location=self.device))
+            model.eval()
+            logging.info(f"成功加载模型: {self.model_path}")
+            return model
+        except Exception as e:
+            logging.error(f"加载模型失败: {e}")
+            return None
+
+    def predict(self, image):
+        """对上传的图片进行预测"""
+        if self.model is None:
+            return None, None
+
+        try:
+            image = Image.open(image).convert("RGB")
+            image = self.transform(image).unsqueeze(0).to(self.device)
+
+            with torch.no_grad():
+                outputs = self.model(image)
+                probabilities = torch.softmax(outputs, dim=1)
+                _, predicted = torch.max(outputs, 1)
+
+            pred_class = self.class_names[predicted.item()]
+            confidence = probabilities[0][predicted.item()].item()
+            return pred_class, confidence
+        except Exception as e:
+            logging.error(f"预测失败: {e}")
+            return None, None
+
+
+class Net(nn.Module):
+    def __init__(self):
+        super(Net, self).__init__()
+        # 使用与训练时相同的densenet版本
+        self.base_model = torchvision.models.densenet121(pretrained=False)
+
+        # 关键修改点：与训练时的特征维度对齐
+        num_ftrs = self.base_model.classifier.in_features
+
+        # 构建与训练完全一致的分类器结构
+        self.base_model.classifier = nn.Sequential(
+            nn.Linear(num_ftrs, 512),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(512, 6)  # 保持6个输出节点
+        )
+
+    def forward(self, x):
+        return self.base_model(x)
+
+
+class City(models.Model):
+    """城市"""
+    name = models.CharField("城市名称", max_length=50, unique=True)
+
+    class Meta:
+        verbose_name = "城市"
+        verbose_name_plural = "城市"
+
+    def __str__(self):
+        return self.name
+
+class County(models.Model):
+    """县区"""
+    name = models.CharField("县区名称", max_length=50)
+    city = models.ForeignKey(City, on_delete=models.CASCADE, related_name="counties")
+
+    class Meta:
+        unique_together = ('name', 'city')  # 确保县区名称在同一个市内唯一
+        verbose_name = "县区"
+        verbose_name_plural = "县区"
+
+    def __str__(self):
+        return self.name  # 仅显示县区名称
+
+
+class Township(models.Model):
+    """乡镇"""
+    name = models.CharField("乡镇名称", max_length=50)
+    county = models.ForeignKey(County, on_delete=models.CASCADE, related_name="townships")
+
+    class Meta:
+        unique_together = ('name', 'county')
+        verbose_name = "乡镇"
+        verbose_name_plural = "乡镇"
+
+    def __str__(self):
+        return self.name  # 仅显示乡镇名称
+
+
+class Location(models.Model):
+
+    id = models.AutoField("序号", primary_key=True)  # 自动递增
+    station_code = models.CharField("站号", max_length=20, unique=True)  # 字母+数字
+    name = models.CharField("站名", max_length=50, unique=True)  # 站点名称
+    city = models.ForeignKey(City, on_delete=models.SET_NULL, null=True, verbose_name="地市")
+    county = models.ForeignKey(County, on_delete=models.SET_NULL, null=True, verbose_name="县区")
+    township = models.ForeignKey(Township, on_delete=models.SET_NULL, null=True, verbose_name="乡镇")
+    longitude = models.CharField("经度", max_length=20, help_text="示例：E106 46 42")
+    latitude = models.CharField("纬度", max_length=20, help_text="示例：N37 16 55")
+
+    class Meta:
+        verbose_name = "马铃薯站"
+        verbose_name_plural = "马铃薯站"
+
+    def __str__(self):
+        return f"{self.station_code} - {self.name}"
+
+    def format_dms(self, value):
+        """格式化用户输入的经纬度"""
+        pattern = r"^([NSEW])\s*(\d+)\s+(\d+)\s+(\d+)$"
+        match = re.match(pattern, value.strip())
+        if match:
+            direction, degrees, minutes, seconds = match.groups()
+            return f"{direction} {degrees}°{minutes}'{seconds}\""
+        return value
+
+    def to_decimal(self, dms_str):
+        """将度分秒 (DMS) 转换为十进制度 (DD)"""
+        pattern = r"([NSEW])\s*(\d+)°(\d+)'(\d+)\""
+        match = re.match(pattern, dms_str.strip())
+        if match:
+            direction, degrees, minutes, seconds = match.groups()
+            decimal = int(degrees) + int(minutes) / 60 + int(seconds) / 3600
+            if direction in ["S", "W"]:  # 南纬或西经为负数
+                decimal = -decimal
+            return round(decimal, 6)  # 保留 6 位小数
+        return None  # 无法转换
+
+    def get_decimal_longitude(self):
+        return self.to_decimal(self.longitude)
+
+    def get_decimal_latitude(self):
+        return self.to_decimal(self.latitude)
+
+    def save(self, *args, **kwargs):
+        """在保存之前格式化经纬度"""
+        self.longitude = self.format_dms(self.longitude)
+        self.latitude = self.format_dms(self.latitude)
+        super().save(*args, **kwargs)
+
+
+class LocationGrowthStage(models.Model):
+    """存储所有马铃薯田的完整生长阶段历史"""
+
+    STAGE_ICONS = {
+        '播种期': 'images/播种期.png',
+        '出苗期': 'images/出苗期.png',
+        '分枝期': 'images/分枝期.png',
+        '花序形成期': 'images/花序形成期.png',
+        '开花期': 'images/flowers.png',
+        '可收期': 'images/可收期.png'
+    }
+
+    location = models.ForeignKey(Location, on_delete=models.CASCADE, related_name='growth_stages', verbose_name="站点")
+    stage = models.CharField("发育阶段", max_length=20)
+    stage_start_time = models.DateTimeField("阶段开始时间")
+    created_at = models.DateTimeField("记录时间", auto_now_add=True)
+
+    @property
+    def icon(self):
+        return self.STAGE_ICONS.get(self.stage, 'images/default.png')
+
+    class Meta:
+        ordering = ['-stage_start_time']
+        verbose_name = "生长阶段历史记录"
+        verbose_name_plural = "生长阶段历史记录"
+
+    def __str__(self):
+        return f"{self.location} - {self.stage} - {self.stage_start_time.strftime('%Y-%m-%d %H:%M')}"
+
+
+class AreaState(models.Model):
+    """存储每个地点最新的生长阶段状态"""
+
+    location = models.OneToOneField(Location, on_delete=models.CASCADE, primary_key=True, related_name='area_state', verbose_name="站点")
+
+    current_stage = models.ForeignKey(LocationGrowthStage, on_delete=models.SET_NULL, null=True,
+                                      verbose_name="最新阶段")
+
+    @property
+    def stage(self):
+        return self.current_stage.stage if self.current_stage else None
+
+    @property
+    def stage_start_time(self):
+        return self.current_stage.stage_start_time if self.current_stage else None
+
+    @property
+    def longitude(self):
+        return self.location.longitude
+
+    @property
+    def latitude(self):
+        return self.location.latitude
+
+    class Meta:
+        verbose_name = "当前生长状态"
+        verbose_name_plural = "当前生长状态"
+
+    def __str__(self):
+        return f"{self.location.name} - 当前状态"
+
+
+@receiver(post_save, sender=LocationGrowthStage)
+def update_area_state(sender, instance, **kwargs):
+    """自动更新最新状态"""
+    latest_stage = LocationGrowthStage.objects.filter(
+        location=instance.location
+    ).order_by('-stage_start_time').first()
+
+    if latest_stage:
+        AreaState.objects.update_or_create(location=instance.location, defaults={'current_stage': latest_stage})
+
+
+class RecognitionResult(models.Model):
+    image = models.ImageField("图片", upload_to='uploads/')
+    location = models.ForeignKey(Location, on_delete=models.CASCADE, null=True, blank=True, verbose_name="站点")
+    stage = models.CharField("识别阶段", max_length=100)
+    confidence = models.FloatField("置信度")
+    shoot_time = models.DateTimeField("拍摄时间", null=True, blank=True)
+    source = models.CharField("来源", max_length=10, choices=[('user', '用户上传'), ('auto', '自动获取')], default='user')
+
+    class Meta:
+        verbose_name = "识别结果"
+        verbose_name_plural = "识别结果"
+
+    def __str__(self):
+        return f"{self.stage} - {self.confidence * 100:.2f}%"
+
+@receiver(post_save, sender=RecognitionResult)
+def update_growth_stage_from_auto(sender, instance, **kwargs):
+    if instance.source != 'auto' or not instance.location:
+        return  # 只处理自动获取的记录
+
+    location = instance.location
+    new_stage = instance.stage
+    shoot_time = instance.shoot_time or now()
+
+    latest_growth = LocationGrowthStage.objects.filter(location=location).order_by('-stage_start_time').first()
+
+    if latest_growth:
+        current_stage_index = STAGE_ORDER.get(latest_growth.stage, -1)
+        new_stage_index = STAGE_ORDER.get(new_stage, -1)
+
+        if new_stage_index <= current_stage_index:
+            return  # 阶段回溯或重复，跳过
+
+        if new_stage_index - current_stage_index > 1:
+            return  # 跨阶段，跳过
+    # 添加新阶段
+    LocationGrowthStage.objects.create(
+        location=location,
+        stage=new_stage,
+        stage_start_time=shoot_time
+    )
+
+@receiver(post_delete, sender=LocationGrowthStage)
+def update_area_state_on_delete(sender, instance, **kwargs):
+    """删除阶段后自动更新AreaState为最新的阶段（或置空）"""
+    latest_stage = LocationGrowthStage.objects.filter(
+        location=instance.location
+    ).order_by('-stage_start_time').first()
+    if latest_stage:
+        AreaState.objects.update_or_create(location=instance.location, defaults={'current_stage': latest_stage})
+    else:
+        # 没有任何阶段了，置空
+        AreaState.objects.update_or_create(location=instance.location, defaults={'current_stage': None})
+
+
+class FetchConfig(models.Model):
+    fetch_dir = models.CharField("图片文件夹或URL", max_length=512)
+    fetch_times = models.IntegerField("每日获取次数", default=1)
+    fetch_timepoints = models.CharField("获取时间点", max_length=256)  # 08:00,12:00,18:00
+    created_at = models.DateTimeField("创建时间", auto_now_add=True)
+
+    class Meta:
+        verbose_name = "自动获取配置"
+        verbose_name_plural = "自动获取配置"
+
+    def __str__(self):
+        return self.fetch_dir
+
+
+#admin.py
+from django.contrib import admin
+from django import forms
+from .models import RecognitionResult, LocationGrowthStage, AreaState, Location, City, County, Township, FetchConfig
+
+@admin.register(RecognitionResult)
+class RecognitionResultAdmin(admin.ModelAdmin):
+    list_display = ('stage', 'confidence', 'source', 'location', 'shoot_time')
+    list_filter = ('source', 'stage', 'location')
+    search_fields = ('stage', 'location__name')
+    readonly_fields = ('image',)  # 上传后不可修改图片
+
+    # 设置中文显示列头（可选）
+    def get_queryset(self, request):
+        return super().get_queryset(request)
+
+    def image_display(self, obj):
+        return obj.image.url if obj.image else ""
+
+    image_display.short_description = '图片'
+
+
+admin.site.site_header = '土豆发育期识别系统管理后台'
+admin.site.site_title = '土豆发育期识别系统管理后台'
+admin.site.index_title = '土豆发育期识别系统管理后台'
+
+
+@admin.register(City)
+class CityAdmin(admin.ModelAdmin):
+    search_fields = ['name']  # 确保外键支持搜索
+
+@admin.register(County)
+class CountyAdmin(admin.ModelAdmin):
+    search_fields = ['name', 'city__name']  # 允许搜索县区名称和所属城市
+
+@admin.register(Township)
+class TownshipAdmin(admin.ModelAdmin):
+    search_fields = ['name', 'county__name', 'county__city__name']  # 允许搜索乡镇、县区和城市
+
+
+class LocationAdminForm(forms.ModelForm):
+    """自定义 Location 表单，支持市-县区-乡镇联动"""
+
+    class Meta:
+        model = Location
+        fields = '__all__'
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # 获取用户选择的市，并动态筛选县区
+        if self.instance.pk and self.instance.city:
+            self.fields['county'].queryset = County.objects.filter(city=self.instance.city).order_by('name')
+        else:
+            self.fields['county'].queryset = County.objects.none()  # 默认空
+
+        # 获取用户选择的县区，并动态筛选乡镇
+        if self.instance.pk and self.instance.county:
+            self.fields['township'].queryset = Township.objects.filter(county=self.instance.county).order_by('name')
+        else:
+            self.fields['township'].queryset = Township.objects.none()  # 默认空
+
+
+class LocationAdmin(admin.ModelAdmin):
+    form = LocationAdminForm
+    list_display = ('id', 'station_code', 'name', 'city', 'county', 'township', 'longitude', 'latitude')
+    search_fields = ('station_code', 'name', 'city__name', 'county__name', 'township__name')
+    list_filter = ('city', 'county', 'township')
+    autocomplete_fields = ['city', 'county', 'township']  # 让外键字段支持搜索
+
+    def get_form(self, request, obj=None, **kwargs):
+        form = super().get_form(request, obj, **kwargs)
+        form.base_fields['longitude'].help_text = "示例：E106 46 42（自动格式化为 E106°46'42\"）"
+        form.base_fields['latitude'].help_text = "示例：N37 16 55（自动格式化为 N37°16'55\"）"
+        return form
+
+    def get_queryset(self, request):
+        """优化列表查询，确保县区和乡镇不会重复包含上级信息"""
+        queryset = super().get_queryset(request).select_related('city', 'county', 'township')
+        return queryset
+
+
+admin.site.register(Location, LocationAdmin)
+
+
+@admin.register(LocationGrowthStage)
+class LocationGrowthStageAdmin(admin.ModelAdmin):
+    list_display = ('get_location_name', 'stage', 'stage_start_time')
+    list_select_related = ['location']  # 预加载外键
+    search_fields = ('location__name', 'stage')
+    list_filter = ('stage',)
+
+    def get_location_name(self, obj):
+        return obj.location.name
+    get_location_name.short_description = '站名'
+    get_location_name.admin_order_field = 'location__name'  # 增加排序支持
+
+@admin.register(AreaState)
+class AreaStateAdmin(admin.ModelAdmin):
+    list_display = ('location', 'get_stage', 'get_start_time')
+    readonly_fields = ('location', 'current_stage')
+
+    def get_stage(self, obj):
+        return obj.current_stage.stage if obj.current_stage else '-'
+    get_stage.short_description = "最新阶段"
+
+    def get_start_time(self, obj):
+        return obj.current_stage.stage_start_time.strftime('%Y-%m-%d %H:%M') if obj.current_stage else '-'
+    get_start_time.short_description = "阶段开始时间"
+
+@admin.register(FetchConfig)
+class FetchConfigAdmin(admin.ModelAdmin):
+    list_display = ('fetch_dir', 'fetch_times', 'fetch_timepoints', 'created_at')
+
+
+
+#views.py
+
+# 标准库导入
+import csv
+import datetime
+import io
+import json
+import logging
+import os
+import sys
+import time
+import traceback
+from collections import Counter, defaultdict
+# 第三方库导入
+import cv2
+import numpy as np
+import torch
+import torchvision
+import torchvision.transforms as T
+from PIL import Image, ImageDraw, ImageFont
+from pyecharts import options as opts
+from pyecharts.charts import Map
+from pyecharts.globals import ChartType, SymbolType
+from ultralytics import YOLO  # ✅ Ultralytics YOLOv8
+# Django 标准库导入
+from django.conf import settings
+from django.contrib import messages
+from django.contrib.auth import login
+from django.contrib.auth.models import User
+from django.core.files.storage import FileSystemStorage
+from django.core.paginator import EmptyPage, PageNotAnInteger, Paginator
+from django.core.serializers.json import DjangoJSONEncoder
+from django.http import HttpResponse, HttpResponseServerError, JsonResponse
+from django.shortcuts import get_object_or_404, redirect, render
+from django.utils import timezone
+from django.views.decorators.csrf import csrf_exempt
+# 本地应用导入
+from .forms import FetchConfigForm, SuperuserCreationForm
+
+from .models import (
+    AreaState,
+    DenseNetModel,
+    GlobalDenseNetModel,
+    Location,
+    LocationGrowthStage,
+    RecognitionResult,
+    FetchConfig,
+)
+from .net import Net
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def fetch_config_view(request):
+    if request.method == 'POST':
+        form = FetchConfigForm(request.POST)
+        if form.is_valid():
+            FetchConfig.objects.all().delete()
+            FetchConfig.objects.create(
+                fetch_dir=form.cleaned_data['fetch_dir'],
+                fetch_times=form.cleaned_data['fetch_times'],
+                fetch_timepoints=form.cleaned_data['fetch_timepoints']
+            )
+            messages.success(request, "定时配置已保存")
+            return redirect('fetch_config')
+    else:
+        config = FetchConfig.objects.last()
+        form = FetchConfigForm(initial={
+            'fetch_dir': config.fetch_dir if config else '',
+            'fetch_times': config.fetch_times if config else 1,
+            'fetch_timepoints': config.fetch_timepoints if config else '',
+        })
+    return render(request, 'potato/image_fetch_config.html', {'form': form})
+
+
+def draw_chinese_text(img, text, position, font_size=50):
+    # 转换OpenCV图像到PIL格式
+    img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(img_pil)
+
+    # 加载中文字体（需要确保字体文件存在）
+    font_path = "C:/Windows/Fonts/simhei.ttf"  # Windows系统字体路径
+    font = ImageFont.truetype(font_path, font_size)
+
+    # 绘制文本
+    draw.text(position, text, font=font, fill=(0, 255, 0))
+
+    # 转换回OpenCV格式
+    return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+
+
+
+# 获取当前 Django 应用的目录
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# 初始化模型
+YOLO_MODEL_PATH = os.path.join(BASE_DIR, "models", "best.pt")
+yolo_model = YOLO(YOLO_MODEL_PATH)
+GLOBAL_MODEL_PATH = os.path.join(BASE_DIR, "models", "best_model_epoch1_acc89.51.pth")
+GLOBAL_MODEL = GlobalDenseNetModel(GLOBAL_MODEL_PATH)
+
+
+class DenseNetModel:
+    def __init__(self, model_path):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.class_names = ["出苗期", "分枝期", "花序形成期", "开花期", "可收期"]
+        self.transform = self._get_transform()  # 先初始化transform
+        self.model = self._load_model(model_path)  # 后加载模型
+
+    def _get_transform(self):
+        """统一的图像预处理流程"""
+        return torchvision.transforms.Compose([
+            torchvision.transforms.Resize((224, 224)),
+            torchvision.transforms.ToTensor(),
+            torchvision.transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )
+        ])
+
+    def _load_model(self, model_path):
+        """带错误处理的模型加载"""
+        try:
+            model = Net()
+            state_dict = torch.load(model_path, map_location=self.device)
+            # 自动过滤不匹配参数
+            model_dict = model.state_dict()
+            matched_dict = {k: v for k, v in state_dict.items() if k in model_dict}
+            model_dict.update(matched_dict)
+
+            model.load_state_dict(model_dict)
+            return model.eval().to(self.device)
+        except Exception as e:
+            print(f"模型加载失败: {e}")
+            return None
+
+    def predict(self, image):
+        """预测方法需使用transform"""
+        if self.model is None:
+            return None, None
+
+        try:
+            # 转换PIL Image为Tensor
+            img_tensor = self.transform(image).unsqueeze(0).to(self.device)
+            with torch.no_grad():
+                outputs = self.model(img_tensor)
+            probabilities = torch.nn.functional.softmax(outputs, dim=1)
+            confidence, preds = torch.max(probabilities, 1)
+            return self.class_names[preds.item()], confidence.item()
+        except Exception as e:
+            print(f"预测错误: {e}")
+            return None, None
+
+
+
+MODEL_PATH = os.path.join(BASE_DIR, "models", "ds.pth")
+DENSENET_MODEL = DenseNetModel(MODEL_PATH)
+
+
+@csrf_exempt
+def combined_predict(request):
+    if request.method == "POST" and request.FILES.getlist("images"):
+        results = []
+
+        for img_file in request.FILES.getlist("images"):
+            fs = FileSystemStorage()
+            filename = fs.save(img_file.name, img_file)
+            img_path = fs.path(filename)
+            img_path_full = os.path.join(settings.MEDIA_ROOT, img_path)
+
+            yolo_results = yolo_model(img_path)
+            boxes = yolo_results[0].boxes.xyxy.cpu().numpy()
+
+            stage_conf_list = []  # [(stage, conf)]
+            img = Image.open(img_path).convert("RGB")
+            img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+            overall_stage = "无马铃薯"
+            use_global = False
+            confidence = None
+
+            print(f"[DEBUG] YOLO检测框数量: {len(boxes)}")
+
+            if len(boxes) == 0:
+                use_global = True
+                stage, confidence = GLOBAL_MODEL.predict(img)
+                overall_stage = stage if stage else "无马铃薯"
+            else:
+                for box in boxes:
+                    x1, y1, x2, y2 = map(int, box)
+                    potato_img = img.crop((x1, y1, x2, y2))
+                    stage, conf = DENSENET_MODEL.predict(potato_img)
+                    if stage:
+                        stage_conf_list.append((stage, conf))
+                        img_cv = draw_chinese_text(img_cv, stage, (x1 + 5, y1 - 35))
+                        cv2.rectangle(img_cv, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+                total = len(stage_conf_list)
+                stages = [s for s, _ in stage_conf_list]
+
+                if total < 5:
+                    emergence = stages.count("出苗期")
+                    if total > 0 and emergence / total >= 0.8:
+                        overall_stage = "播种期"
+                else:
+                    for stage in ["出苗期", "分枝期", "花序形成期", "开花期", "可收期"]:
+                        if stages.count(stage) / total >= 0.6:
+                            overall_stage = stage
+                            break
+
+                # ✅ 计算最终置信度
+                if overall_stage != "无马铃薯":
+                    matched_conf = [conf for s, conf in stage_conf_list if s == overall_stage]
+                    if matched_conf:
+                        confidence = (len(matched_conf) / total) * (sum(matched_conf) / len(matched_conf))
+
+            # 保存处理后图像
+            detected_dir = os.path.join("media", "detected")
+            os.makedirs(detected_dir, exist_ok=True)
+            detected_path = os.path.join(detected_dir, filename)
+            cv2.imwrite(detected_path, img_cv)
+
+            # 保存到数据库
+            result = RecognitionResult(
+                stage=overall_stage,
+                confidence=confidence if confidence is not None else 0.0,
+                source="user",
+            )
+            result.image.save(filename, img_file, save=True)
+            result.save()
+            if os.path.exists(img_path_full):
+                os.remove(img_path_full)
+            results.append({
+                "original": f"/media/uploads/{filename}",
+                "detected": f"/media/detected/{filename}",
+                "overall_stage": overall_stage,
+                "stages": stages if boxes.any() else [overall_stage],
+                "is_global": use_global,
+                "confidence": round(confidence, 4) if confidence else None
+            })
+
+        return JsonResponse({"results": results})
+
+    return JsonResponse({"error": "未上传图片"}, status=400)
+
+
+
+def pre_page(request):
+    return render(request, 'potato/local_dec.html')
+
+def home(request):
+    """获取所有地点的最新状态"""
+    current_states = AreaState.objects.select_related('location', 'current_stage').all()
+
+    map_data = []
+    for state in current_states:
+        growth_stages = state.location.growth_stages.order_by('stage_start_time')
+
+        stage_info = [
+            {
+                'stage': stage.stage,
+                'start_time': stage.stage_start_time.strftime("%Y-%m-%d %H:%M")
+            }
+            for stage in growth_stages
+        ]
+
+        # 转换 经纬度 到十进制（地图需要）
+        decimal_longitude = state.location.get_decimal_longitude()
+        decimal_latitude = state.location.get_decimal_latitude()
+
+        map_data.append({
+            'name': state.location.name,
+            'station_code': state.location.station_code,
+            'stages': stage_info,
+            'icon': state.current_stage.icon if state.current_stage else 'images/default.png',
+            'coord': [decimal_longitude, decimal_latitude]
+        })
+
+    context = {
+        'area_states': current_states,
+        'map_data': map_data
+    }
+    return render(request, 'potato/home.html', context)
+
+
+# 创建一个日志记录器
+logger = logging.getLogger(__name__)
+
+
+def about(request):  #加载yolo模型并检测结果
+    return render(request, 'potato/about.html')
+
+def latest_news(request):
+    return render(request, 'potato/latest_news.html',{'title':'最新动态'})
+
+#统计
+def location_growth_stage(request):
+    """统计页面，支持多地点、多状态筛选"""
+    # 获取所有可用选项
+    locations = list(Location.objects.values_list('id', 'name').order_by('name'))
+    all_location_ids = [loc[0] for loc in locations]
+    all_stages = list(LocationGrowthStage.objects.values_list('stage', flat=True).distinct().order_by('stage'))
+
+    # 处理地点参数
+    location_filter = []
+    for loc in request.GET.getlist('location'):
+        if loc.strip().isdigit():  # 确保是数字
+            location_id = int(loc)
+            if location_id in all_location_ids:
+                location_filter.append(location_id)
+    if not location_filter:
+        location_filter = all_location_ids  # 如果无效，则显示全部
+
+    # 处理状态参数
+    stage_filter = []
+    for stg in request.GET.getlist('stage'):
+        if stg in all_stages:  # 直接检查字符串匹配
+            stage_filter.append(stg)
+    if not stage_filter:
+        stage_filter = all_stages  # 如果无效，则显示全部
+
+    # 获取符合筛选条件的数据
+    location_growth_stages = LocationGrowthStage.objects.all()
+    if location_filter != all_location_ids:
+        location_growth_stages = location_growth_stages.filter(location__id__in=location_filter)
+    if stage_filter != all_stages:
+        location_growth_stages = location_growth_stages.filter(stage__in=stage_filter)
+
+    context = {
+        'location_growth_stages': location_growth_stages,
+        'locations': locations,
+        'stages': all_stages,
+        'location_filter': location_filter,
+        'stage_filter': stage_filter,
+    }
+    return render(request, 'potato/location_growth_stage.html', context)
+
+#文件下载
+def download_location_growth_stage(request):
+    """导出 Excel（CSV），支持地点和状态的筛选"""
+
+    # **确保正确解析地点参数**
+    location_filter_str = request.GET.get("location", "").strip()
+    location_filter = [int(loc) for loc in location_filter_str.split(",") if
+                       loc.isdigit()] if location_filter_str else []
+
+    # **确保正确解析状态参数**
+    stage_filter_str = request.GET.get("stage", "").strip()
+    stage_filter = stage_filter_str.split(",") if stage_filter_str else []
+
+    # **应用筛选**
+    records = LocationGrowthStage.objects.all()
+    if location_filter:
+        records = records.filter(location__id__in=location_filter)
+    if stage_filter:
+        records = records.filter(stage__in=stage_filter)
+
+    # **生成 CSV（Excel 兼容）**
+    response = HttpResponse(content_type='text/csv')
+    response[
+        'Content-Disposition'] = f'attachment; filename="growth_stage_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}.csv"'
+
+    response.write('\ufeff')  # 解决 Excel 乱码
+    writer = csv.writer(response)
+    writer.writerow(['地点', '状态', '时间点'])
+
+    for record in records:
+        local_time = timezone.localtime(record.stage_start_time)  # 确保时区正确
+        writer.writerow([
+            record.location.name,
+            record.stage,
+            local_time.strftime("%Y年%m月%d日 %H:%M")  # 确保格式一致
+        ])
+
+    return response
+
+
+def create_superuser_view(request):
+    if request.method == 'POST':
+        form = SuperuserCreationForm(request.POST)
+        if form.is_valid():
+            username = form.cleaned_data['username']
+            password = form.cleaned_data['password']
+            User.objects.create_superuser(username=username, password=password, email=None)
+            messages.success(request, f"超级用户 '{username}' 创建成功！")
+            return redirect('admin:index')  # 跳转到后台首页
+    else:
+        form = SuperuserCreationForm()
+    return render(request, 'potato/create_superuser.html', {'form': form})
+
+
+
