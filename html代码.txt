@@ -1,0 +1,195 @@
+#base.html
+{% load static %}
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH" crossorigin="anonymous">
+    <link rel="stylesheet" type="text/css" href="{% static 'potato/main.css' %}">
+    {% if title %}
+        <title>马统（开发中） - {{ title }}</title>
+    {% else %}
+        <title>马统（开发中）</title>
+    {% endif %}
+</head>
+<body>
+    <!-- 🌟 顶部导航栏 -->
+    <header class="site-header">
+        <nav class="navbar">
+            <!-- 🕒 左侧：当前时间 -->
+                <!-- 🕒 左上角时间 -->
+                <div id="current-time" class="text-light">
+                    {{ current_time }}
+                </div>
+
+
+            <!-- ✨ 居中大标题 -->
+            <h1 id="main-title">马铃薯发育期识别系统</h1>
+
+            <!-- 🔄 右侧占位（用于保持标题居中） -->
+            <div class="text-light mx-3"></div>
+        </nav>
+    </header>
+
+    <!-- 📌 左右导航栏 -->
+    <div class="nav-container">
+        <!-- 左侧导航 -->
+        <div class="nav-left">
+            <a class="nav-button" href="{% url 'potato-home' %}">展示</a>
+            <a class="nav-button" href="/admin/">后台管理</a>  <!-- ✅ 新增的后台入口 -->
+            <a class="nav-button" href="{% url 'create_superuser' %}">创建超级用户</a>
+        </div>
+
+        <!-- 右侧导航 -->
+        <div class="nav-right">
+            <a class="nav-button" href="{% url 'potato-upload' %}">获取图片和识别</a>
+            <a class="nav-button" href="{% url 'location_growth_stage' %}">统计下载</a>
+            <a class="nav-button" href="{% url 'fetch_config' %}">修改自动获取图片地址</a>
+
+
+        </div>
+    </div>
+
+    <!-- 🌎 主要内容区域 -->
+    <main role="main" class="container-fluid mt-5 pt-5">
+        {% block content %}
+
+        {% endblock %}
+    </main>
+
+    <script>
+        // 🕒 自动更新时间（每秒更新一次）
+        function updateTime() {
+            let now = new Date();
+            let timeString = now.toLocaleTimeString();
+            document.getElementById("current-time").innerText = timeString;
+        }
+        setInterval(updateTime, 1000);
+    </script>
+</body>
+</html>
+
+#home.html
+{% extends "potato/base.html" %}
+{% load static %}
+
+{% block content %}
+<div class="container mt-5">
+    <div class="row">
+            <!-- 🔹 左下角图例（宽度可调） -->
+                <div id="growth-stage-legend">
+                    <h5>发育阶段图示</h5>
+                    <ul>
+                        <li><a style="color: #007bff;">播种期</a> <img src="{% static 'images/播种期.png' %}" alt="播种期" style="width: 50px; height: 50px;"></li>
+                        <li><a style="color: #007bff;">出苗期</a> <img src="{% static 'images/出苗期.png' %}" alt="苗期" style="width: 50px; height: 50px;"></li>
+                        <li><a style="color: #007bff;">分枝期</a> <img src="{% static 'images/分枝期.png' %}" alt="成熟期" style="width: 50px; height: 50px;"></li>
+                        <li><a style="color: #007bff;">花序形成期</a> <img src="{% static 'images/花序形成期.png' %}" alt="成熟期" style="width: 50px; height: 65px;"></li>
+                        <li><a style="color: #007bff;">开花期</a> <img src="{% static 'images/flowers.png' %}" alt="开花期" style="width: 50px; height: 65px;"></li>
+                        <li><a style="color: #007bff;">可收期</a> <img src="{% static 'images/可收期.png' %}" alt="成熟期" style="width: 50px; height: 50px;"></li>
+
+                    </ul>
+                </div>
+
+        <!-- 右侧区域：展示地图 -->
+        <div class="col-md-8">
+            <div id="ningxia-map" style="top: -80px; width: 250%; height: 800px; border: none;"></div>
+            <div class="hologram-light"></div>  <!-- 🔹 灯光投影 -->
+            <div class="hologram-light2"></div>
+            <script src="https://cdn.jsdelivr.net/npm/echarts@5.6.0/dist/echarts.min.js"></script>
+            <script>
+                const chart = echarts.init(document.getElementById('ningxia-map'));
+
+                // 确保坐标与地图数据匹配
+                const mapData = [
+                        {% for state in map_data %}
+                        {
+                            name: "{{ state.name|escapejs }}",
+                            icon: "{% static state.icon %}",
+                            coord: {{ state.coord }},
+                            stages: [
+                                {% for stage in state.stages %}
+                                {
+                                    stage: "{{ stage.stage|escapejs }}",
+                                    time: "{{ stage.start_time|escapejs }}"
+                                },
+                                {% endfor %}
+                            ]
+                        },
+                        {% endfor %}
+                    ];
+
+                fetch("{% static 'geo/ningxia.json' %}")
+                    .then(response => response.json())
+                    .then(ningxiaGeo => {
+                        echarts.registerMap('ningxia', ningxiaGeo);
+
+                        const option = {
+                            title: {
+                                text: '',
+                                left: 'center'
+                            },
+                             tooltip: {
+                trigger: 'item',
+                formatter: ({ name, data }) => {
+                    if (!data) return name;
+
+                    let stageInfo = data.stages.map(stage =>
+                        `${stage.stage}: ${stage.time}`
+                    ).join('<br/>');
+
+                    return `
+                        <strong>${name}</strong><br/>
+                        ${stageInfo}
+                    `;
+                }
+            },
+                            geo: {
+                                map: 'ningxia',
+                                roam: true,
+                                itemStyle: {
+                                    areaColor:  '#87CEEB',  // 统一地图背景色
+                                    borderColor: '#FFFFFF',
+                                    borderWidth: 2
+                                },
+                                emphasis: {
+                                    itemStyle: {
+                                        areaColor: '#87CEEB'  // 悬停时的高亮颜色
+                                    }
+                                }
+                            },
+                            series: [{
+                                type: 'scatter',
+                                coordinateSystem: 'geo',
+                                symbolSize: 40,
+                                label: {
+                                    show: true,
+                                    position: 'bottom',
+                                    formatter: ({ data }) =>
+                                        `${data.name}`,
+                                    fontSize: 12,
+                                    backgroundColor: 'rgba(255,255,255,0.8)',
+                                    padding: [4, 8]
+                                },
+                                itemStyle: {
+                                    opacity: 0.9
+                                },
+                                data: mapData.map(item => ({
+                                    name: item.name,
+                                    value: item.coord,
+                                    stages: item.stages,
+                                    symbol: `image://${item.icon}`,
+                                    symbolSize: [60, 60]
+                                }))
+                            }]
+                        };
+
+                        chart.setOption(option);
+                    })
+                    .catch(error => console.error('地图加载失败:', error));
+
+                window.addEventListener('resize', () => chart.resize());
+            </script>
+        </div>
+    </div>
+</div>
+{% endblock content %}
