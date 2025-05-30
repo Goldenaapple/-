@@ -193,3 +193,160 @@
     </div>
 </div>
 {% endblock content %}
+
+#local_dec.html
+{% extends "potato/base.html" %}
+{% load static %}
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+</head>
+{% block content %}
+
+<!-- 强制整个页面下移 -->
+<style>
+    body {
+        padding-top: 250px !important;  /* 确保整个页面向下移动 */
+    }
+    .container {
+        margin-top: 50px; /* 额外调整 container 的间距 */
+    }
+</style>
+
+<div class="container">
+    <h2 class="text-center mb-4 title-glow mb-4">批量上传图片并识别</h2>
+
+    <!-- 上传表单 -->
+    <form id="uploadForm" enctype="multipart/form-data">
+        {% csrf_token %}
+        <div class="mb-3">
+            <label for="imageInput" class="form-label">选择图片文件（可多选）:</label>
+            <input type="file" class="form-control" id="imageInput" name="images" accept="image/*" multiple required>
+        </div>
+        <button type="submit" class="btn btn-primary">上传并识别</button>
+        <button type="button" class="btn btn-primary" id="toggleBoxes">显示方框</button>
+    </form>
+
+    <!-- 显示识别结果 -->
+    <div id="result-container" class="mt-4"></div>
+    <div id="time-stats" class="mt-4"></div>
+</div>
+
+<script>
+let showBoxes = false;
+
+document.getElementById('toggleBoxes').addEventListener('click', function() {
+    showBoxes = !showBoxes;
+    this.textContent = showBoxes ? '隐藏检测框' : '显示检测框';
+    document.querySelectorAll('.result-image').forEach(img => {
+        img.src = showBoxes ? img.dataset.detected : img.dataset.original;
+    });
+});
+
+document.getElementById("uploadForm").addEventListener("submit", function(event) {
+    event.preventDefault();
+    const startTime = performance.now();
+
+    let formData = new FormData();
+    let imageFiles = document.getElementById("imageInput").files;
+
+    if (imageFiles.length === 0) {
+        alert("请至少选择一张图片！");
+        return;
+    }
+
+    for (let i = 0; i < imageFiles.length; i++) {
+        formData.append("images", imageFiles[i]);
+    }
+
+    fetch("/predict_images/", {
+        method: "POST",
+        body: formData
+    })
+    .then(response => response.json())
+    .then(data => {
+        const endTime = performance.now();
+        const duration = ((endTime - startTime)/1000).toFixed(2);
+
+        let resultContainer = document.getElementById("result-container");
+        resultContainer.innerHTML = "";
+
+        if (data.error) {
+            resultContainer.innerHTML = `<div class="alert alert-danger">${data.error}</div>`;
+            return;
+        }
+        let globalShown = false;
+        data.results.forEach((result, index) => {
+        // 添加条件过滤无效结果项
+        if (
+            (result.is_global && !globalShown) ||
+            (!result.is_global && result.stages && result.stages.length > 0)
+        ) {
+            let resultDiv = document.createElement("div");
+            resultDiv.className = "image-container";
+            resultDiv.innerHTML = `
+                <div class="mb-2">
+                 <pre style="display:none;">${JSON.stringify(result, null, 2)}</pre>
+                    ${result.is_global ?
+                        '<span class="global-tag">整图分析结果</span>' :
+                        '<span class="yolo-tag">目标检测结果</span>'}
+                </div>
+                <div class="row">
+                    <div class="col-md-6">
+                        <div class="card">
+                            <div class="card-header">原始图片</div>
+                            <img src="${result.original}" class="card-img-top">
+                        </div>
+                    </div>
+                    <div class="col-md-6">
+                        <div class="card">
+                            <div class="card-header">分析结果</div>
+                            <img class="card-img-top result-image"
+                                 data-original="${result.original}"
+                                 data-detected="${result.detected}"
+                                 src="${showBoxes ? result.detected : result.original}"
+                                 alt="分析结果">
+                            <div class="card-body">
+    <p class="stage-result">
+        <i class="bi bi-arrow-right-circle"></i>
+        发育阶段：<strong>${result.overall_stage}</strong>
+    </p>
+    ${result.is_global && result.confidence ? `
+        <p class="text-muted">
+            <small>识别置信度：${(result.confidence * 100).toFixed(2)}%</small>
+        </p>` : ''}
+    ${!result.is_global ? `
+        <p class="text-muted">
+            <small>检测到 ${result.stages.length} 个马铃薯植株</small>
+        </p>` : ''}
+</div>
+                        </div>
+                    </div>
+                </div>
+            `;
+            resultContainer.appendChild(resultDiv);
+        }
+    });
+})
+    .catch(error => console.error("Error:", error));
+});
+</script>
+<style>
+
+        /* 🌟 发光标题样式 */
+.title-glow {
+    color: #fff;
+    text-shadow: 0 0 12px rgba(0, 162, 255, 0.8);
+}
+
+    html, body {
+    height: 100%;
+    overflow: auto; /* 允许页面滚动 */
+}
+</style>
+{% endblock content %}
+
+
+
+
