@@ -954,3 +954,363 @@ def create_superuser_view(request):
 
 
 
+#fetch_and_predict.py
+import time
+import datetime
+import logging
+import os
+import django
+from urllib.parse import urlparse
+from urllib.request import url2pathname
+from io import BytesIO
+
+import numpy as np
+import torch
+from PIL import Image, ImageOps
+import torchvision.transforms as transforms
+import cv2
+import requests
+
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'by.settings')
+django.setup()
+from django.conf import settings
+from django.core.files.base import File
+from django.utils.timezone import make_aware
+from potato.models import RecognitionResult, Location, FetchConfig
+from potato.net import GlobalNet, Net
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+YOLO_MODEL_PATH = os.path.join(BASE_DIR, "models", "best.pt")
+GLOBAL_MODEL_PATH = os.path.join(BASE_DIR, "models", "best_model_epoch1_acc89.51.pth")
+MODEL_PATH = os.path.join(BASE_DIR, "models", "ds.pth")
+
+from ultralytics import YOLO
+
+class GlobalDenseNetModel:
+    def __init__(self, model_path):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model_path = model_path
+        self.transform = self.get_transform()
+        self.model = self.load_model()
+        self.class_names = ["播种期", "出苗期", "分枝期", "花序形成期", "开花期", "可收期"]
+
+    def get_transform(self):
+        return transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+
+    def load_model(self):
+        try:
+            model = GlobalNet()
+            state_dict = torch.load(self.model_path, map_location=self.device)
+            fixed_dict = {}
+            for k, v in state_dict.items():
+                if k.startswith("densenet."):
+                    fixed_k = k.replace("densenet.", "base.")
+                    fixed_dict[fixed_k] = v
+                else:
+                    fixed_dict[k] = v
+            model.load_state_dict(fixed_dict, strict=False)
+            return model.to(self.device).eval()
+        except Exception as e:
+            print(f"[ERROR] 全局模型加载失败: {e}")
+            return None
+
+    def predict(self, image):
+        if self.model is None:
+            return None, None
+        try:
+            if isinstance(image, str) or hasattr(image, 'read'):
+                image = Image.open(image).convert("RGB")
+            elif isinstance(image, Image.Image):
+                image = image.convert("RGB")
+            else:
+                raise ValueError("无效的 image 类型")
+            image = ImageOps.exif_transpose(image)
+            image = self.transform(image).unsqueeze(0).to(self.device)
+            with torch.no_grad():
+                outputs = self.model(image)
+                probabilities = torch.softmax(outputs, dim=1)
+                _, predicted = torch.max(outputs, 1)
+            pred_class = self.class_names[predicted.item()]
+            confidence = probabilities[0][predicted.item()].item()
+            return pred_class, confidence
+        except Exception as e:
+            logging.error(f"全局模型预测失败: {e}")
+            return None, None
+
+class DenseNetModel:
+    def __init__(self, model_path):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model_path = model_path
+        self.transform = self.get_transform()
+        self.model = self.load_model()
+        self.class_names = ["出苗期", "分枝期", "花序形成期", "开花期", "可收期"]
+    def get_transform(self):
+        return transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+    def load_model(self):
+        try:
+            model = Net()
+            state_dict = torch.load(self.model_path, map_location=self.device)
+            model.load_state_dict(state_dict)
+            return model.eval().to(self.device)
+        except Exception as e:
+            logging.error(f"DenseNet模型加载失败: {e}")
+            return None
+    def predict(self, image):
+        if self.model is None:
+            return None, None
+        try:
+            if isinstance(image, str) or hasattr(image, 'read'):
+                image = Image.open(image).convert("RGB")
+            elif isinstance(image, Image.Image):
+                image = image.convert("RGB")
+            else:
+                raise ValueError("无效的 image 类型")
+            image = ImageOps.exif_transpose(image)
+            image = self.transform(image).unsqueeze(0).to(self.device)
+            with torch.no_grad():
+                outputs = self.model(image)
+                probabilities = torch.softmax(outputs, dim=1)
+                _, predicted = torch.max(outputs, 1)
+            idx = predicted.item()
+            if idx >= len(self.class_names):
+                logging.error(f"DenseNet类别索引越界: {idx} >= {len(self.class_names)}")
+                return None, None
+            pred_class = self.class_names[idx]
+            confidence = probabilities[0][idx].item()
+            return pred_class, confidence
+        except Exception as e:
+            logging.error(f"DenseNet模型预测失败: {e}")
+            return None, None
+
+def draw_chinese_text(img_cv, text, pos, color=(0,255,0), font_scale=0.7, thickness=2):
+    from PIL import ImageFont, ImageDraw
+    font_path = os.path.join(BASE_DIR, "simhei.ttf")
+    font = ImageFont.truetype(font_path, 22)
+    img_pil = Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(img_pil)
+    draw.text(pos, text, font=font, fill=color)
+    return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+
+yolo_model = YOLO(YOLO_MODEL_PATH)
+GLOBAL_MODEL = GlobalDenseNetModel(GLOBAL_MODEL_PATH)
+DENSENET_MODEL = DenseNetModel(MODEL_PATH)
+
+def list_images_in_folder(folder_url):
+    if folder_url.startswith("file://"):
+        parsed_url = urlparse(folder_url)
+        local_path = url2pathname(parsed_url.path)
+        if os.name == 'nt' and local_path.startswith('/'):
+            local_path = local_path.lstrip('/')
+        files = os.listdir(local_path)
+        return [
+            os.path.join(local_path, f)
+            for f in files
+            if f.lower().endswith(('.jpg', '.jpeg', '.png'))
+        ]
+    elif folder_url.startswith("http"):
+        list_url = folder_url.rstrip('/') + '/list.json'
+        try:
+            resp = requests.get(list_url, timeout=10)
+            if resp.status_code == 200:
+                return resp.json().get('images', [])
+        except Exception as e:
+            print(f"❌ 获取远程图片列表失败: {e}")
+        return []
+    else:
+        return []
+
+def fetch_and_predict():
+    config = FetchConfig.objects.last()
+    if not config:
+        print("❌ 未配置图片文件夹地址")
+        return
+
+    folder_url = config.fetch_dir.strip()
+    print(f"📥 当前图片文件夹地址为: {folder_url}")
+
+    all_images = list_images_in_folder(folder_url)
+    if not all_images:
+        print("❌ 未找到任何图片")
+        return
+
+    processed_count = 0
+    new_count = 0
+
+    for img_path in all_images:
+        filename = os.path.basename(img_path)
+
+        # 解析站点号与时间
+        parts = filename.split('_')
+        if len(parts) < 3:
+            print(f"❌ 文件名格式错误：{filename}")
+            continue
+        station_code = parts[0]
+        timestamp_str = parts[2]
+        try:
+            shoot_time = datetime.datetime.strptime(timestamp_str, "%Y%m%d%H%M%S")
+            shoot_time = make_aware(shoot_time)
+        except Exception as e:
+            print(f"❌ 时间解析失败：{e}，文件名: {filename}")
+            continue
+
+        try:
+            location = Location.objects.get(station_code=station_code)
+        except Location.DoesNotExist:
+            print(f"❌ 未找到站点：{station_code}")
+            continue
+
+        exists = RecognitionResult.objects.filter(
+            location=location,
+            shoot_time=shoot_time,
+            source='auto'
+        ).exists()
+        if exists:
+            processed_count += 1
+            print(f"⏩ 已识别过: {filename}, 跳过")
+            continue
+
+        # 读取图片
+        try:
+            if img_path.startswith("http"):
+                response = requests.get(img_path, timeout=10)
+                response.raise_for_status()
+                image_bytes = response.content
+                img = Image.open(BytesIO(image_bytes)).convert("RGB")
+            else:
+                img = Image.open(img_path).convert("RGB")
+                with open(img_path, "rb") as f:
+                    image_bytes = f.read()
+            img = ImageOps.exif_transpose(img)
+            img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        except Exception as e:
+            print(f"❌ 图片打开失败：{e}，文件名: {filename}")
+            continue
+
+        # YOLO推理
+        yolo_results = yolo_model(img)
+        boxes = yolo_results[0].boxes.xyxy.cpu().numpy() if hasattr(yolo_results[0], 'boxes') else []
+
+        stage_conf_list = []
+        stages = []
+        overall_stage = "无马铃薯"
+        use_global = False
+        confidence = None
+
+        print(f"[DEBUG] YOLO检测框数量: {len(boxes)}")
+
+        if len(boxes) == 0:
+            use_global = True
+            stage, confidence = GLOBAL_MODEL.predict(img)
+            overall_stage = stage if stage else "无马铃薯"
+            stages = [overall_stage]
+        else:
+            for box in boxes:
+                x1, y1, x2, y2 = map(int, box)
+                potato_img = img.crop((x1, y1, x2, y2))
+                stage, conf = DENSENET_MODEL.predict(potato_img)
+                if stage:
+                    stage_conf_list.append((stage, conf))
+                    img_cv = draw_chinese_text(img_cv, stage, (x1 + 5, y1 - 35))
+                    cv2.rectangle(img_cv, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+            total = len(stage_conf_list)
+            stages = [s for s, _ in stage_conf_list]
+
+            if total < 5:
+                emergence = stages.count("出苗期")
+                if total > 0 and emergence / total >= 0.8:
+                    overall_stage = "播种期"
+            else:
+                for stage in ["出苗期", "分枝期", "花序形成期", "开花期", "可收期"]:
+                    if stages.count(stage) / total >= 0.6:
+                        overall_stage = stage
+                        break
+
+            if overall_stage != "无马铃薯":
+                matched_conf = [conf for s, conf in stage_conf_list if s == overall_stage]
+                if matched_conf:
+                    confidence = (len(matched_conf) / total) * (sum(matched_conf) / len(matched_conf))
+
+        # 保存检测后图片
+        detected_dir = os.path.join(settings.MEDIA_ROOT, "detected")
+        os.makedirs(detected_dir, exist_ok=True)
+        detected_path = os.path.join(detected_dir, filename)
+        cv2.imwrite(detected_path, img_cv)
+
+        # 保存到数据库
+        try:
+            result = RecognitionResult(
+                stage=overall_stage,
+                confidence=confidence if confidence is not None else 0.0,
+                source="auto",
+                location=location,
+                shoot_time=shoot_time
+            )
+            # 保存原图
+            result.image.save(filename, File(BytesIO(image_bytes)), save=True)
+            result.save()
+            print(f"✅ 成功保存识别结果：{location.name} - {overall_stage} ({filename})")
+            new_count += 1
+        except Exception as e:
+            print(f"❌ 保存识别结果失败：{e}，文件名: {filename}")
+            continue
+
+    print(f"\n处理完成，本次新增 {new_count} 张，已存在 {processed_count} 张，全部图片数 {len(all_images)}")
+
+def get_today_timepoints(timepoints_str):
+    """
+    解析 '08:00,12:00,18:00' 为今日的 datetime 对象列表
+    """
+    today = datetime.date.today()
+    points = []
+    for t in timepoints_str.split(","):
+        t = t.strip()
+        if not t:
+            continue
+        hour, minute = map(int, t.split(":"))
+        points.append(datetime.datetime.combine(today, datetime.time(hour, minute)))
+    return points
+
+def schedule_fetch_by_timepoints():
+    print("[定时任务] 启动自动定时调度...")
+    last_run_points = set()
+    while True:
+        config = FetchConfig.objects.last()
+        if not config or not config.fetch_timepoints:
+            print("[定时任务] 未配置时间点，等待60秒后重试")
+            time.sleep(60)
+            continue
+
+        now = datetime.datetime.now()
+        today_points = get_today_timepoints(config.fetch_timepoints)
+
+        for point in today_points:
+            # 允许在时间点±60秒内触发，防止小误差
+            if point.date() == now.date() and \
+                point not in last_run_points and \
+                abs((now - point).total_seconds()) < 60:
+                print(f"[定时任务] 到达时间点 {point.strftime('%H:%M')}，自动执行任务")
+                fetch_and_predict()
+                last_run_points.add(point)
+
+        # 如果跨天，重置已运行点
+        if any(p.date() < now.date() for p in last_run_points):
+            last_run_points.clear()
+        time.sleep(20)
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "once":
+        fetch_and_predict()
+    else:
+        schedule_fetch_by_timepoints()
